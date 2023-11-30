@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
-	"github.com/pkg/errors"
 )
 
 type CLIConfig struct {
@@ -27,7 +26,11 @@ type CLIConfig struct {
 	Verbose        bool   `help:"Enable verbose mode." short:"d"`
 	Version        bool   `help:"Show version and exit." short:"v"`
 	BindAddress    string `help:"Bind address for the HTTP proxy." default:"127.0.0.1" short:"b" type:"ip"`
+	Insecure       bool   `help:"Enable access to non-HTTPS ports in CONNECT requests & to unsafe hosts." short:"i" default:"false"`
 }
+
+var httpsPorts = []int{443, 2053, 2083, 2087, 2096, 8443}
+var unsafeHosts = []string{"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "[::]", "::ffff:127.0.0.1", "localhost.localdomain", "localhost.local"}
 
 func main() {
 	var cliConfig CLIConfig
@@ -53,7 +56,7 @@ func main() {
 		log.Fatalf("Error parsing IPv6 with prefix: %v", err)
 	}
 
-	proxy := NewRotatingProxy(ipv6, prefix, cliConfig.Port, cliConfig.Verbose, cliConfig.BindAddress)
+	proxy := NewRotatingProxy(ipv6, prefix, cliConfig.Port, cliConfig.Verbose, cliConfig.BindAddress, cliConfig.Insecure)
 	err = proxy.Start()
 	if err != nil {
 		log.Fatalf("Error starting HTTP proxy: %v", err)
@@ -63,32 +66,34 @@ func main() {
 func parseIPv6WithPrefix(ipv6WithPrefix string) (net.IP, int, error) {
 	parts := strings.Split(ipv6WithPrefix, "/")
 	if len(parts) != 2 {
-		return nil, 0, errors.New("invalid IPv6 with prefix. Expected format: ipv6/prefix")
+		return nil, 0, fmt.Errorf("invalid IPv6 with prefix. Expected format: ipv6/prefix")
 	}
 
 	ip := net.ParseIP(parts[0])
 	prefixLen, err := strconv.Atoi(parts[1])
 	if err != nil {
-		return nil, 0, errors.New("invalid prefix length")
+		return nil, 0, fmt.Errorf("invalid prefix length")
 	}
 	return ip, prefixLen, nil
 }
 
 type RotatingProxy struct {
-	IPv6    net.IP
-	Prefix  int
-	Port    int
-	Verbose bool
-	Bind    string
+	IPv6     net.IP
+	Prefix   int
+	Port     int
+	Verbose  bool
+	Bind     string
+	Insecure bool
 }
 
-func NewRotatingProxy(ipv6 net.IP, prefix int, port int, verbose bool, bind string) *RotatingProxy {
+func NewRotatingProxy(ipv6 net.IP, prefix int, port int, verbose bool, bind string, insecure bool) *RotatingProxy {
 	return &RotatingProxy{
-		IPv6:    ipv6,
-		Prefix:  prefix,
-		Port:    port,
-		Verbose: verbose,
-		Bind:    bind,
+		IPv6:     ipv6,
+		Prefix:   prefix,
+		Port:     port,
+		Verbose:  verbose,
+		Bind:     bind,
+		Insecure: insecure,
 	}
 }
 
@@ -96,7 +101,7 @@ func (rp *RotatingProxy) Start() error {
 	listenAddr := fmt.Sprintf("%s:%d", rp.Bind, rp.Port)
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return errors.Wrap(err, "error listening on address")
+		return fmt.Errorf("error listening on %s: %v", listenAddr, err)
 	}
 	defer ln.Close()
 	fmt.Printf("Starting HTTP proxy on %s\n", listenAddr)
@@ -140,7 +145,7 @@ func (rp *RotatingProxy) Start() error {
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		return errors.Wrap(err, "error shutting down server")
+		return fmt.Errorf("error shutting down server: %v", err)
 	}
 	return nil
 }
@@ -153,6 +158,12 @@ func (rp *RotatingProxy) newHTTPServer(ln net.Listener) *http.Server {
 
 func (rp *RotatingProxy) newHTTPHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rp.Insecure && isUnsafeHost(r.URL.Hostname()) {
+			// NOTE: This is not RFC compliant since we send a Content-Length header
+			// but this way we can avoid code duplication.
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		newIPv6 := rp.rotateIPv6()
 
 		if r.Method == http.MethodConnect {
@@ -161,6 +172,28 @@ func (rp *RotatingProxy) newHTTPHandler() http.Handler {
 			rp.handleHTTP(w, r, newIPv6)
 		}
 	})
+}
+
+func isHTTPS(port string) bool {
+	portInt, err := strconv.Atoi(port)
+	if err != nil {
+		return false
+	}
+	for _, httpsPort := range httpsPorts {
+		if portInt == httpsPort {
+			return true
+		}
+	}
+	return false
+}
+
+func isUnsafeHost(host string) bool {
+	for _, unsafeHost := range unsafeHosts {
+		if host == unsafeHost {
+			return true
+		}
+	}
+	return false
 }
 
 func (rp *RotatingProxy) handleConnect(w http.ResponseWriter, r *http.Request, newIPv6 net.IP) {
@@ -176,7 +209,11 @@ func (rp *RotatingProxy) handleConnect(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 
-	_, _ = io.WriteString(clientConn, "HTTP/1.1 200 OK\r\n\r\n")
+	if !rp.Insecure && !isHTTPS(r.URL.Port()) {
+		_, _ = clientConn.Write([]byte("HTTP/1.1 400 Only HTTPS is supported\r\n\r\n"))
+		_ = clientConn.Close()
+		return
+	}
 
 	dialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{IP: newIPv6},
@@ -184,9 +221,12 @@ func (rp *RotatingProxy) handleConnect(w http.ResponseWriter, r *http.Request, n
 
 	proxyConn, err := dialer.Dial("tcp", r.URL.Host)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		_, _ = clientConn.Write([]byte("HTTP/1.1 500 Remote connect failed\r\n\r\n"))
+		_ = clientConn.Close()
 		return
 	}
+
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	go func() {
 		_, _ = io.Copy(proxyConn, clientConn)
@@ -245,7 +285,7 @@ func generateRandomIPv6(prefix string) string {
 
 func generateRandomIPv6InPrefix(ip net.IP, prefixLen int) (net.IP, error) {
 	if ip.To4() != nil {
-		return nil, errors.New("invalid IPv6 address")
+		return nil, fmt.Errorf("IPv4 address not supported")
 	}
 
 	randomIPv6 := make(net.IP, len(ip))
