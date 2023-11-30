@@ -10,8 +10,8 @@ if [ -z "$REMOTE_IP" ] || [ -z "$IPV6_WITH_PREFIX" ]; then
   exit 1
 fi
 
-if ! lsmod | grep -q '^ipv6'; then
-  echo "ipv6 module is not loaded"
+if ! lsmod | grep -q '^sit'; then
+  echo "sit module is not loaded"
   exit 1
 fi
 
