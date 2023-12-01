@@ -36,7 +36,7 @@ ip tunnel add he-ipv6 mode sit remote $REMOTE_IP local $LOCAL_IP ttl $TTL || {
 }
 ip link set he-ipv6 up
 ip addr add $IPV6_WITH_PREFIX dev he-ipv6
-ip route add ::/0 dev he-ipv6
+ip route replace ::/0 dev he-ipv6
 
 if [ -n "$ADDITIONAL_RANGE" ]; then
     if ! sysctl -q -n net.ipv6.ip_nonlocal_bind | grep -q '^1$'; then
